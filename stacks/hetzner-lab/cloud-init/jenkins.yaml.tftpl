@@ -1,0 +1,202 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /root/provisioning-info.txt
+    permissions: "0644"
+    content: |
+      Project: ${project_name}
+      Environment: ${environment}
+      Role: Jenkins
+      K3s private endpoint: https://${k3s_private_ip}:6443
+      SonarQube private URL: http://${sonar_private_ip}:9000
+
+  - path: /usr/local/bin/provision-jenkins.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+
+      export DEBIAN_FRONTEND=noninteractive
+      export NEEDRESTART_MODE=a
+      export APT_LISTCHANGES_FRONTEND=none
+
+      timedatectl set-timezone Europe/Rome || true
+
+      mkdir -p /etc/needrestart/conf.d
+      cat >/etc/needrestart/conf.d/99-auto.conf <<'EOF'
+      $nrconf{restart} = 'a';
+      EOF
+
+      apt_install() {
+        apt-get install -y \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" \
+          "$@"
+      }
+
+      echo "[INFO] Updating apt repositories..."
+      apt-get update
+
+      echo "[INFO] Installing base packages with Java 21..."
+      apt_install \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        unzip \
+        jq \
+        gnupg \
+        lsb-release \
+        apt-transport-https \
+        software-properties-common \
+        openjdk-21-jdk \
+        netcat-openbsd
+
+      echo "[INFO] Configuring Java 21..."
+      update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java || true
+      update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac || true
+
+      cat >/etc/profile.d/java.sh <<'EOF'
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+      export PATH=$JAVA_HOME/bin:$PATH
+      EOF
+
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+      export PATH=$JAVA_HOME/bin:$PATH
+
+      java -version
+
+      echo "[INFO] Installing Docker..."
+      install -m 0755 -d /etc/apt/keyrings
+
+      rm -f /etc/apt/keyrings/docker.gpg
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+
+      . /etc/os-release
+
+      cat >/etc/apt/sources.list.d/docker.list <<EOF
+      deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable
+      EOF
+
+      apt-get update
+
+      apt_install \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+      systemctl enable docker
+      systemctl start docker
+
+      echo "[INFO] Installing Node.js ${node_version}.x..."
+      curl -fsSL https://deb.nodesource.com/setup_${node_version}.x | bash -
+      apt_install nodejs
+
+      echo "[INFO] Installing Jenkins with 2026 signing key..."
+      rm -f /usr/share/keyrings/jenkins-keyring.asc
+      rm -f /etc/apt/sources.list.d/jenkins.list
+
+      curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key | tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+
+      cat >/etc/apt/sources.list.d/jenkins.list <<'EOF'
+      deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/
+      EOF
+
+      apt-get update
+      apt_install jenkins
+
+      usermod -aG docker jenkins
+
+      systemctl daemon-reload
+      systemctl enable jenkins
+      systemctl start jenkins
+
+      echo "[INFO] Installing kubectl..."
+      cd /tmp
+      rm -f stable.txt kubectl
+      curl -LO "https://dl.k8s.io/release/stable.txt"
+      KUBECTL_VERSION="$(cat stable.txt)"
+      curl -LO "https://dl.k8s.io/release/$${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+      echo "[INFO] Installing Helm..."
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      echo "[INFO] Installing yq..."
+      wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+      chmod +x /usr/local/bin/yq
+
+      echo "[INFO] Installing Trivy..."
+      rm -f /usr/share/keyrings/trivy.gpg
+      wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+
+      cat >/etc/apt/sources.list.d/trivy.list <<'EOF'
+      deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main
+      EOF
+
+      apt-get update
+      apt_install trivy
+
+      echo "[INFO] Preparing Jenkins kubeconfig directory..."
+      install -d -o jenkins -g jenkins -m 700 /var/lib/jenkins/.kube
+
+      echo "[INFO] Creating connectivity helper..."
+      cat >/usr/local/bin/check-lab-connectivity.sh <<'EOF'
+      #!/usr/bin/env bash
+      set -e
+
+      echo "Checking K3s API private endpoint..."
+      nc -vz ${k3s_private_ip} 6443 || true
+
+      echo "Checking SonarQube private endpoint..."
+      nc -vz ${sonar_private_ip} 9000 || true
+      EOF
+
+      chmod +x /usr/local/bin/check-lab-connectivity.sh
+
+      echo "[INFO] Restarting Jenkins after Docker group assignment..."
+      systemctl restart jenkins
+
+      echo "[INFO] Writing tool versions..."
+      {
+        echo "Docker:"
+        docker --version || true
+        docker compose version || true
+        echo
+
+        echo "Java:"
+        java -version || true
+        echo
+
+        echo "Node:"
+        node --version || true
+        npm --version || true
+        echo
+
+        echo "kubectl:"
+        kubectl version --client=true || true
+        echo
+
+        echo "Helm:"
+        helm version || true
+        echo
+
+        echo "Trivy:"
+        trivy --version || true
+        echo
+
+        echo "Jenkins:"
+        systemctl status jenkins --no-pager || true
+      } > /root/tool-versions.txt 2>&1
+
+      echo "[INFO] Jenkins provisioning completed."
+
+runcmd:
+  - /usr/local/bin/provision-jenkins.sh > /var/log/provision-jenkins.log 2>&1
+
+final_message: "Jenkins VM provisioning completed."

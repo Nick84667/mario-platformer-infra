@@ -1,0 +1,104 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - git
+  - jq
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - apt-transport-https
+  - netcat-openbsd
+
+write_files:
+  - path: /root/provisioning-info.txt
+    permissions: "0644"
+    content: |
+      Project: ${project_name}
+      Environment: ${environment}
+      Role: K3s server
+      Private IP: 10.10.1.20
+
+  - path: /usr/local/bin/provision-k3s.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+
+      timedatectl set-timezone Europe/Rome
+
+      # Kernel/network settings for Kubernetes
+      modprobe overlay || true
+      modprobe br_netfilter || true
+
+      cat >/etc/modules-load.d/k3s.conf <<'EOF'
+      overlay
+      br_netfilter
+      EOF
+
+      cat >/etc/sysctl.d/99-k3s.conf <<'EOF'
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      EOF
+
+      sysctl --system
+
+      # K3s server
+      curl -sfL https://get.k3s.io | K3S_TOKEN="${k3s_token}" sh -s - server \
+        --write-kubeconfig-mode 644 \
+        --node-ip 10.10.1.20 \
+        --advertise-address 10.10.1.20 \
+        --tls-san 10.10.1.20
+
+      # kubeconfig root
+      mkdir -p /root/.kube
+      cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+      chmod 600 /root/.kube/config
+
+      # kubeconfig for Jenkins with private endpoint
+      sed 's#https://127.0.0.1:6443#https://10.10.1.20:6443#g' /etc/rancher/k3s/k3s.yaml > /root/kubeconfig-jenkins-private.yaml
+      chmod 600 /root/kubeconfig-jenkins-private.yaml
+
+      # Helm
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      # Wait K3s
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      for i in $(seq 1 30); do
+        kubectl get nodes && break
+        sleep 10
+      done
+
+      # ArgoCD
+      kubectl create namespace argocd || true
+      kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+      # Application namespace
+      kubectl create namespace mario-platformer-dev || true
+
+      # Status
+      kubectl get nodes -o wide > /root/k3s-nodes.txt || true
+      kubectl get pods -A > /root/k3s-pods.txt || true
+
+      {
+        echo "kubectl:"
+        kubectl version --client || true
+        echo
+        echo "helm:"
+        helm version || true
+        echo
+        echo "nodes:"
+        kubectl get nodes -o wide || true
+        echo
+        echo "argocd pods:"
+        kubectl get pods -n argocd || true
+      } > /root/tool-versions.txt 2>&1
+
+runcmd:
+  - /usr/local/bin/provision-k3s.sh > /var/log/provision-k3s.log 2>&1
+
+final_message: "K3s VM provisioning completed."

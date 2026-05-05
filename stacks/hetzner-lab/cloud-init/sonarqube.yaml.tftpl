@@ -1,0 +1,160 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /root/provisioning-info.txt
+    permissions: "0644"
+    content: |
+      Project: ${project_name}
+      Environment: ${environment}
+      Role: SonarQube
+      Private IP: 10.10.1.30
+
+  - path: /etc/sysctl.d/99-sonarqube.conf
+    permissions: "0644"
+    content: |
+      vm.max_map_count=524288
+      fs.file-max=131072
+
+  - path: /opt/sonarqube/docker-compose.yml
+    permissions: "0644"
+    content: |
+      services:
+        postgres:
+          image: postgres:16
+          container_name: sonarqube-postgres
+          restart: unless-stopped
+          environment:
+            POSTGRES_USER: sonar
+            POSTGRES_PASSWORD: ${sonar_db_password}
+            POSTGRES_DB: sonar
+          volumes:
+            - sonarqube_postgres_data:/var/lib/postgresql/data
+          networks:
+            - sonarnet
+
+        sonarqube:
+          image: sonarqube:community
+          container_name: sonarqube
+          restart: unless-stopped
+          depends_on:
+            - postgres
+          ports:
+            - "9000:9000"
+          environment:
+            SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonar
+            SONAR_JDBC_USERNAME: sonar
+            SONAR_JDBC_PASSWORD: ${sonar_db_password}
+          volumes:
+            - sonarqube_data:/opt/sonarqube/data
+            - sonarqube_extensions:/opt/sonarqube/extensions
+            - sonarqube_logs:/opt/sonarqube/logs
+          networks:
+            - sonarnet
+
+      volumes:
+        sonarqube_postgres_data:
+        sonarqube_data:
+        sonarqube_extensions:
+        sonarqube_logs:
+
+      networks:
+        sonarnet:
+          driver: bridge
+
+  - path: /usr/local/bin/provision-sonarqube.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+
+      export DEBIAN_FRONTEND=noninteractive
+      export NEEDRESTART_MODE=a
+      export APT_LISTCHANGES_FRONTEND=none
+
+      timedatectl set-timezone Europe/Rome || true
+
+      mkdir -p /etc/needrestart/conf.d
+      cat >/etc/needrestart/conf.d/99-auto.conf <<'EOF'
+      $nrconf{restart} = 'a';
+      EOF
+
+      apt_install() {
+        apt-get install -y \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" \
+          "$@"
+      }
+
+      echo "[INFO] Applying SonarQube sysctl settings..."
+      sysctl --system
+
+      echo "[INFO] Updating apt repositories..."
+      apt-get update
+
+      echo "[INFO] Installing base packages..."
+      apt_install \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        jq \
+        gnupg \
+        lsb-release \
+        apt-transport-https \
+        software-properties-common \
+        openjdk-21-jdk
+
+      echo "[INFO] Installing Docker..."
+      install -m 0755 -d /etc/apt/keyrings
+
+      rm -f /etc/apt/keyrings/docker.gpg
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+
+      . /etc/os-release
+
+      cat >/etc/apt/sources.list.d/docker.list <<EOF
+      deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable
+      EOF
+
+      apt-get update
+
+      apt_install \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+      systemctl enable docker
+      systemctl start docker
+
+      echo "[INFO] Starting SonarQube stack..."
+      cd /opt/sonarqube
+      docker compose up -d
+
+      echo "[INFO] Writing tool versions and container status..."
+      {
+        echo "Docker:"
+        docker --version || true
+        docker compose version || true
+        echo
+
+        echo "Java:"
+        java -version || true
+        echo
+
+        echo "Containers:"
+        docker ps || true
+      } > /root/tool-versions.txt 2>&1
+
+      docker ps > /root/docker-ps.txt || true
+
+      echo "[INFO] SonarQube provisioning completed."
+
+runcmd:
+  - /usr/local/bin/provision-sonarqube.sh > /var/log/provision-sonarqube.log 2>&1
+
+final_message: "SonarQube VM provisioning completed."

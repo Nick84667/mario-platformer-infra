@@ -33,3 +33,20 @@ output "ssh_command_k3s" {
 output "ssh_command_sonarqube" {
   value = "ssh -i ~/.ssh/mario_platformer_lab root@${hcloud_server.sonarqube.ipv4_address}"
 }
+
+output "jenkins_url" {
+  value = "http://${hcloud_server.jenkins.ipv4_address}:8080"
+}
+
+output "sonarqube_url" {
+  value = "http://${hcloud_server.sonarqube.ipv4_address}:9000"
+}
+
+output "k3s_api_private_url" {
+  value = "https://10.10.1.20:6443"
+}
+
+output "jenkins_kubeconfig_path" {
+  value = "/var/lib/jenkins/.kube/config"
+}
+

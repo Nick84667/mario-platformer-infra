@@ -36,3 +36,4 @@ resource "hcloud_firewall" "base" {
     source_ips = ["0.0.0.0/0", "::/0"]
   }
 }
+
